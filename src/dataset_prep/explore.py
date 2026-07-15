@@ -20,3 +20,13 @@ print("\n=== VISION ===")
 f_vision = h5py.File("data/CMU-MOSEI/visuals/CMU_MOSEI_VisualFacet42.csd", "r")
 count = 0
 f_vision.visititems(limited_print)
+
+print("\n=== VISUAL OPEN FACE ===")
+f = h5py.File("data/CMU-MOSEI/visuals/CMU_MOSEI_VisualOpenFace2.csd", "r")
+seq_name = list(f.keys())[0]
+sample_vid = list(f[seq_name]["data"].keys())[0]
+print(f[seq_name]["data"][sample_vid]["features"].shape)
+
+intervals = f[seq_name]["data"][sample_vid]["intervals"][:]
+duration = intervals[-1][1]  # end time of the last row
+print(f"Duration: {duration:.1f}s, Rows: {len(intervals)}, Rate: {len(intervals)/duration:.1f} samples/sec")

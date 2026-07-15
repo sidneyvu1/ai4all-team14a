@@ -10,12 +10,12 @@ Run this once. It saves a single .npz file you'll reuse for all modeling work.
 import h5py
 import numpy as np
 
-VISION_PATH = "data/CMU-MOSEI/visuals/CMU_MOSEI_VisualFacet42.csd"
+VISION_PATH = "data/CMU-MOSEI/visuals/CMU_MOSEI_VisualOpenFace2.csd"
 LABELS_PATH = "data/CMU-MOSEI/labels/CMU_MOSEI_Labels.csd"
-OUTPUT_PATH = "data/CMU-MOSEI/mosei_video_only_processed.npz"
+OUTPUT_PATH = "data/CMU-MOSEI/mosei_visualopenface_only_processed.npz"
 
 SEQ_LEN = 50       # standard community sequence length
-FEATURE_DIM = 35   # FACET feature dimensionality (confirm this matches your data below)
+FEATURE_DIM = 713   # FACET feature dimensionality (confirm this matches your data below)
 
 
 def load_csd(path):
@@ -105,6 +105,12 @@ def main():
 
     np.savez(OUTPUT_PATH, X=X, y=y, ids=np.array(ids))
     print(f"\nSaved to {OUTPUT_PATH}")
+
+    print("\nLabel columns, in order: [sentiment, happy, sad, anger, surprise, disgust, fear]")
+
+
+LABEL_NAMES = ["sentiment", "happy", "sad", "anger", "surprise", "disgust", "fear"]
+
 
 
 if __name__ == "__main__":
