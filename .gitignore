@@ -1,3 +1,17 @@
 data/
 *.npz
 *.csd
+# Environments
+venv/
+.env
+.vscode/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Massive Data Files
+*.h5
+*.csd
+data/raw/
+data/processed/
