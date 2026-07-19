@@ -5,5 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cmu-multimodal-sdk>=0.0.6",
+    "gradio>=6.20.0",
+    "h5py>=3.16.0",
     "kagglehub[hf-datasets,pandas-datasets]>=1.0.2",
+    "mediapipe>=0.10.35",
+    "numpy>=2.5.1",
+    "opencv-python>=5.0.0.93",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.9.0",
 ]
