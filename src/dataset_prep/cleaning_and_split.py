@@ -1,6 +1,6 @@
 import numpy as np
 
-data = np.load("data/CMU-MOSEI/mosei_video_only_processed.npz")
+data = np.load("data/CMU-MOSEI/mosei_visualopenface_only_processed.npz")
 print(data)
 X, y, ids = data["X"], data["y"], data["ids"]
 

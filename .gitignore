@@ -1,6 +1,8 @@
 data/
 *.npz
 *.csd
+src/models/artifacts/
+*.joblib
 # Environments
 venv/
 .env

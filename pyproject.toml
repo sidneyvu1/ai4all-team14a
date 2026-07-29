@@ -8,6 +8,7 @@ dependencies = [
     "cmu-multimodal-sdk>=0.0.6",
     "gradio>=6.20.0",
     "h5py>=3.16.0",
+    "joblib>=1.5.3",
     "kagglehub[hf-datasets,pandas-datasets]>=1.0.2",
     "mediapipe>=0.10.35",
     "numpy>=2.5.1",
