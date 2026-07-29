@@ -7,6 +7,7 @@ which doubles as its label: level in {mild, moderate, strong} maps to intensity
 
 import os
 import re
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
@@ -19,7 +20,7 @@ from mediapipe.tasks.python.vision import (
 )
 
 CALIBRATION_DIR = "data/calibration"
-MODEL_PATH = "src/ui/assets/face_landmarker.task"
+MODEL_PATH = str(Path(__file__).resolve().parents[2] / "src" / "ui" / "assets" / "face_landmarker.task")
 OUTPUT_PATH = "data/calibration_features.npz"
 
 EMOTIONS = ["happy", "sad", "anger", "surprise", "disgust", "fear"]

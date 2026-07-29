@@ -32,11 +32,13 @@ dependencies = [
     { name = "h5py" },
     { name = "joblib" },
     { name = "kagglehub", extra = ["hf-datasets", "pandas-datasets"] },
+    { name = "matplotlib" },
     { name = "mediapipe" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pandas" },
     { name = "scikit-learn" },
+    { name = "scipy" },
 ]
 
 [package.metadata]
@@ -46,11 +48,13 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "joblib", specifier = ">=1.5.3" },
     { name = "kagglehub", extras = ["hf-datasets", "pandas-datasets"], specifier = ">=1.0.2" },
+    { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "mediapipe", specifier = ">=0.10.35" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "opencv-python", specifier = ">=5.0.0.93" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "scikit-learn", specifier = ">=1.9.0" },
+    { name = "scipy", specifier = ">=1.18.0" },
 ]
 
 [[package]]

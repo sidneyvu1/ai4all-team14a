@@ -1,14 +1,19 @@
-"""Extracts MediaPipe blendshape features from a diverse CREMA-D actor subset.
+"""Extracts MediaPipe blendshape features from the full CREMA-D actor set.
 
 CREMA-D clips are named <ActorID>_<Sentence>_<Emotion>_<Intensity>.flv, where
 Intensity in {LO, MD, HI} maps to CMU-MOSEI's 0-3 scale (1/2/3), XX means
 "unspecified" and is skipped for non-neutral emotions (ambiguous target
 level), and NEU clips anchor the 0-intensity baseline for all six emotions.
 
-This mirrors src/dataset_prep/extract_calibration_features.py, but pulls a
-much more diverse set of actors instead of a single self-recorded person, to
-test whether more real subjects fixes the backwards intensity ordering seen
-on the tiny solo calibration set.
+This mirrors src/dataset_prep/extract_calibration_features.py. An earlier
+version of this script used a hand-picked 15-actor subset (chosen for
+demographic diversity via VideoDemographics.csv) instead of a single
+self-recorded person, which fixed the backwards intensity ordering seen on
+the tiny solo calibration set. This version uses all 91 actors instead: with
+only 15 actors, each emotion's held-out val/test set had as few as 6-9
+clips -- too small to tell "the model is bad at this emotion" apart from
+"the eval sample is too small to measure it". All 91 actors are already
+downloaded locally, so this needs no new recording.
 """
 
 import os
@@ -25,12 +30,7 @@ CREMAD_DIR = (
     r"C:\Users\andys\.cache\kagglehub\datasets\orvile"
     r"\crema-d-emotional-multimodal-dataset\versions\1\content\CREMA-D\VideoFlash"
 )
-OUTPUT_PATH = "data/cremad_features.npz"
-
-SELECTED_ACTORS = {
-    "1005", "1002", "1019", "1007", "1034", "1013", "1072", "1050",
-    "1091", "1048", "1006", "1038", "1082", "1047", "1017",
-}
+OUTPUT_PATH = "data/cremad_features_full.npz"
 
 EMOTION_CODE_MAP = {
     "ANG": "anger", "DIS": "disgust", "FEA": "fear",
@@ -60,8 +60,8 @@ def parse_label(filename):
 
 def main():
     files = sorted(f for f in os.listdir(CREMAD_DIR) if f.endswith(".flv"))
-    files = [f for f in files if f.split("_")[0] in SELECTED_ACTORS]
-    print(f"Found {len(files)} clips for {len(SELECTED_ACTORS)} selected actors")
+    actor_count = len({f.split("_")[0] for f in files})
+    print(f"Found {len(files)} clips for {actor_count} actors")
 
     X, y, clip_names, actor_ids, feature_names = [], [], [], [], None
     skipped = 0

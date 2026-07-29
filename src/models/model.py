@@ -14,10 +14,10 @@ def pool_features(X):
     return X.max(axis=1)
 
 
-def build_model():
+def build_model(n_estimators=150, max_depth=15):
     return RandomForestRegressor(
-        n_estimators=150,
-        max_depth=15,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
         random_state=42,
         n_jobs=-1,
     )
