@@ -1,7 +1,7 @@
 # Team 14a AI4All Project
 
 ## Members
-
+    Andy Sosa, Sidney Vu
 ## About
 
 ## Dataset
