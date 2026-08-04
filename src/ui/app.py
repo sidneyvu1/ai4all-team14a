@@ -56,6 +56,18 @@ REGRESSOR_PATH = (
 # re-tuning once the peaks graph makes that trade-off visible.
 WINDOW_SECONDS = 0.5
 
+# How often Gradio invokes process_frame, decoupled from WINDOW_SECONDS: the
+# pooling window can stay wide for robustness while the stream itself runs
+# much faster, since each call only has to re-pool a small deque rather than
+# rebuild anything expensive.
+STREAM_EVERY_SECONDS = 0.1
+
+# Rebuilding the peaks figure (matplotlib figure creation + legend + layout)
+# costs ~150-200ms regardless of history size -- far more than detect+predict
+# combined -- so it only happens on this cadence. The intensity label still
+# updates every prediction at STREAM_EVERY_SECONDS.
+PLOT_REFRESH_SECONDS = 1.0
+
 # A local maximum in an emotion's intensity-over-time series only gets marked
 # as a "peak" on the graph if it clears both thresholds -- height alone would
 # flag e.g. a sustained mild-but-noisy signal as a string of peaks.
@@ -71,6 +83,11 @@ _landmarker = FaceLandmarker.create_from_options(
     )
 )
 _regressor = load(REGRESSOR_PATH)
+# n_jobs=-1 (set at training time for fitting on the full dataset) makes
+# single-row inference *slower*: joblib pays multiprocess/thread dispatch
+# overhead on every predict() call that dwarfs the actual tree traversal.
+# Force in-process sequential prediction for live use (~75ms -> ~25ms/call).
+_regressor.n_jobs = 1
 
 
 def _pool_recent_blendshapes(window, now):
@@ -119,12 +136,30 @@ def build_peaks_figure(history):
     ax.set_title("Emotion intensity over session (^ marks a detected peak)")
     ax.legend(loc="upper right", fontsize=8, ncol=3)
     fig.tight_layout()
+    # gr.Plot only needs the Figure object itself (already fully drawn above);
+    # without this, matplotlib keeps every past figure registered in pyplot's
+    # global state for the life of the process, leaking memory and eventually
+    # slowing down figure creation as the session goes on.
+    plt.close(fig)
     return fig
 
 
+# Temporary: prints a per-call timing breakdown to stdout so we can see, on
+# the actual deployment machine/browser/webcam, where time is really going
+# (gap-since-last-call reveals frontend/network stalls; the rest is backend
+# compute). Set to False once the bottleneck is found and fixed.
+DEBUG_TIMING = True
+_last_call_end = None
+
+
 def process_frame(frame, session_start, history, blendshape_window):
+    global _last_call_end
+    call_start = time.perf_counter()
+    gap_ms = None if _last_call_end is None else (call_start - _last_call_end) * 1000
+
     if frame is None:
-        return None, None, gr.skip(), session_start, history, blendshape_window
+        _last_call_end = time.perf_counter()
+        return None, None, session_start, history, blendshape_window
 
     if session_start is None:
         session_start = time.monotonic()
@@ -132,8 +167,10 @@ def process_frame(frame, session_start, history, blendshape_window):
         blendshape_window = deque()
 
     now = time.monotonic()
+    t0 = time.perf_counter()
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
     result = _landmarker.detect(mp_image)
+    detect_ms = (time.perf_counter() - t0) * 1000
 
     annotated = frame.copy()
     for face_landmarks in result.face_landmarks:
@@ -148,14 +185,40 @@ def process_frame(frame, session_start, history, blendshape_window):
     # of holding a stale prediction indefinitely.
     pooled = _pool_recent_blendshapes(blendshape_window, now)
     if pooled is None:
-        return annotated, None, gr.skip(), session_start, history, blendshape_window
+        if DEBUG_TIMING:
+            print(
+                f"[timing] gap={gap_ms}ms detect={detect_ms:.1f}ms "
+                f"frame={frame.shape} no-pooled-data"
+            )
+        _last_call_end = time.perf_counter()
+        return annotated, None, session_start, history, blendshape_window
 
+    t0 = time.perf_counter()
     intensities = _regressor.predict(pooled)[0]
+    predict_ms = (time.perf_counter() - t0) * 1000
     history.append((now - session_start, intensities))
 
     label = dict(zip(EMOTIONS, intensities.tolist()))
-    fig = build_peaks_figure(history)
-    return annotated, label, fig, session_start, history, blendshape_window
+
+    if DEBUG_TIMING:
+        total_ms = (time.perf_counter() - call_start) * 1000
+        gap_str = f"{gap_ms:.0f}ms" if gap_ms is not None else "n/a"
+        print(
+            f"[timing] gap={gap_str} frame={frame.shape} "
+            f"detect={detect_ms:.1f}ms predict={predict_ms:.1f}ms "
+            f"total_backend={total_ms:.1f}ms"
+        )
+    _last_call_end = time.perf_counter()
+
+    return annotated, label, session_start, history, blendshape_window
+
+
+def refresh_plot(history):
+    """Runs on its own gr.Timer, fully decoupled from the webcam stream --
+    bundling this into process_frame's return meant every ~150-200ms
+    round trip periodically ballooned to 500ms+ while the browser downloaded
+    and rendered the plot image before it could capture the next frame."""
+    return build_peaks_figure(history)
 
 
 def reset_session():
@@ -174,22 +237,48 @@ with gr.Blocks(title="Neuromarketing Ad-Testing — Live Emotion Intensity") as 
     blendshape_window_state = gr.State(None)
 
     with gr.Row():
-        cam = gr.Image(sources=["webcam"], streaming=True, type="numpy", label="Webcam")
+        cam = gr.Image(
+            sources=["webcam"],
+            streaming=True,
+            type="numpy",
+            label="Webcam",
+            # Unconstrained getUserMedia falls back to Gradio's own default
+            # of 1920x1440 (see ImageUploader's `a?.video || {width:{ideal:
+            # 1920}, ...}`) -- constraints MUST be nested under a "video" key
+            # to override that default, a flat {"width": ...} dict is
+            # silently ignored. The frontend only takes its NEXT snapshot
+            # once the current round trip (encode -> upload -> detect/
+            # predict -> download) has returned, so a bigger frame doesn't
+            # just cost more compute, it directly stalls the capture rate.
+            webcam_options=gr.WebcamOptions(
+                constraints={
+                    "video": {
+                        "width": {"ideal": 480, "max": 640},
+                        "height": {"ideal": 360, "max": 480},
+                        "frameRate": {"ideal": 30},
+                    },
+                },
+            ),
+        )
         landmarks_out = gr.Image(type="numpy", label="Landmarks")
 
     label_out = gr.Label(label="Predicted emotion intensity (0-3 scale)")
     plot_out = gr.Plot(label="Emotional peaks this session")
     reset_btn = gr.Button("Reset session")
+    plot_timer = gr.Timer(PLOT_REFRESH_SECONDS)
 
     cam.stream(
         fn=process_frame,
         inputs=[cam, session_start_state, history_state, blendshape_window_state],
         outputs=[
-            landmarks_out, label_out, plot_out,
+            landmarks_out, label_out,
             session_start_state, history_state, blendshape_window_state,
         ],
-        stream_every=WINDOW_SECONDS,
+        stream_every=STREAM_EVERY_SECONDS,
     )
+    # Runs independently of cam.stream() -- the plot never shares a payload
+    # with the fast landmark/label updates, so it can never stall them.
+    plot_timer.tick(fn=refresh_plot, inputs=[history_state], outputs=[plot_out])
     reset_btn.click(
         fn=reset_session,
         outputs=[
