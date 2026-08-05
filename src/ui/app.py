@@ -42,6 +42,22 @@ from mediapipe.tasks.python.vision import (
 )
 from scipy.signal import find_peaks
 
+try:
+    import spaces
+except ImportError:  # not running on a Hugging Face Space
+    spaces = None
+
+
+@(spaces.GPU if spaces else (lambda fn: fn))
+def _zerogpu_dummy():
+    """Unused. Its only purpose is the @spaces.GPU decorator: this app is
+    CPU-only, but Hugging Face's free tier requires ZeroGPU hardware, which
+    in turn requires at least one @spaces.GPU function to exist -- without
+    this, the Space fails its startup check. Everything else still runs on
+    the normal CPU allocation; this function is never called."""
+    return None
+
+
 # Real app name (was the placeholder "EmotionPulse"). Still a single
 # constant so it's a one-line change if the team renames the product later.
 APP_TITLE = "Real-Time Emotion Analysis"

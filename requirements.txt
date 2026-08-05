@@ -8,3 +8,4 @@ scikit-learn==1.9.0
 scipy==1.18.0
 matplotlib==3.11.1
 joblib==1.5.3
+spaces
