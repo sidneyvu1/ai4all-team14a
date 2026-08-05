@@ -128,18 +128,16 @@ def _new_history():
 
 
 def _new_landmarker():
-    # VIDEO mode (not IMAGE) lets MediaPipe exploit temporal coherence
-    # between consecutive webcam frames instead of redetecting from scratch
-    # every call, which lowers per-frame latency -- the same mode
-    # extract_calibration_features.py already uses for clips. It requires
-    # strictly increasing per-instance timestamps, which process_frame
-    # supplies via a per-session timestamp counter.
+    # Use IMAGE mode instead of VIDEO mode to avoid graphics library dependencies
+    # (libGLESv2.so.2) that aren't available in headless environments like HF Spaces.
+    # IMAGE mode doesn't exploit temporal coherence between frames, but it's
+    # compatible with headless servers and requires no graphics acceleration.
     try:
-        print(f"Initializing FaceLandmarker with model at {LANDMARKER_MODEL_PATH}", flush=True)
+        print(f"Initializing FaceLandmarker (IMAGE mode) with model at {LANDMARKER_MODEL_PATH}", flush=True)
         return FaceLandmarker.create_from_options(
             FaceLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
-                running_mode=RunningMode.VIDEO,
+                running_mode=RunningMode.IMAGE,
                 num_faces=1,
                 output_face_blendshapes=True,
             )
@@ -470,15 +468,8 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
                     frame = frame.astype(np.uint8)
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-        # VIDEO mode requires strictly increasing timestamps for the lifetime of
-        # the landmarker instance. Wall-clock elapsed-ms-since-session-start is
-        # monotonic in practice, but the +1 fallback guards against the
-        # occasional same-millisecond tie between two fast round trips.
-        timestamp_ms = int((now - session_start) * 1000)
-        if timestamp_ms <= last_video_timestamp_ms:
-            timestamp_ms = last_video_timestamp_ms + 1
-        last_video_timestamp_ms = timestamp_ms
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        # IMAGE mode: no timestamp tracking needed, simpler and works on headless servers
+        result = landmarker.detect(mp_image)
     except Exception as e:
         print(f"Error in process_frame: {e}", flush=True)
         import traceback
