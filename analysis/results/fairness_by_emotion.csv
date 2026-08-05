@@ -1,0 +1,67 @@
+dimension,subgroup,emotion,mae
+Sex,Female,anger,0.3438736115061797
+Sex,Female,disgust,0.32894395940720633
+Sex,Female,fear,0.4685184391855867
+Sex,Female,happy,0.2326088519757014
+Sex,Female,sad,0.36548517922085877
+Sex,Female,surprise,0.13619147845172674
+Sex,Male,anger,0.40290761978426043
+Sex,Male,disgust,0.3985250930928742
+Sex,Male,fear,0.3720041173924036
+Sex,Male,happy,0.2733042905533309
+Sex,Male,sad,0.40083400791431245
+Sex,Male,surprise,0.09031087357338023
+Race,African American,anger,0.34216195887764345
+Race,African American,disgust,0.3031071346367004
+Race,African American,fear,0.4121626079067578
+Race,African American,happy,0.3149133969621218
+Race,African American,sad,0.35954185874769523
+Race,African American,surprise,0.11141863582078916
+Race,Asian,anger,0.2520523293387513
+Race,Asian,disgust,0.36293648301807324
+Race,Asian,fear,0.3193356511042098
+Race,Asian,happy,0.1815650477240279
+Race,Asian,sad,0.40820482614810455
+Race,Asian,surprise,0.039196042294946186
+Race,Caucasian,anger,0.40085193820005965
+Race,Caucasian,disgust,0.400739025482062
+Race,Caucasian,fear,0.38841700504308296
+Race,Caucasian,happy,0.24247609727254218
+Race,Caucasian,sad,0.3990936025413405
+Race,Caucasian,surprise,0.10070394848086994
+Race,Unknown,anger,0.37283238559728393
+Race,Unknown,disgust,0.2950273705560787
+Race,Unknown,fear,0.8739962170084896
+Race,Unknown,happy,0.2430592833124593
+Race,Unknown,sad,0.32972398209756487
+Race,Unknown,surprise,0.2891821716700854
+Ethnicity,Hispanic,anger,0.34666437461255284
+Ethnicity,Hispanic,disgust,0.3002261957354726
+Ethnicity,Hispanic,fear,0.5082897699719701
+Ethnicity,Hispanic,happy,0.23451411926496651
+Ethnicity,Hispanic,sad,0.3598858561161238
+Ethnicity,Hispanic,surprise,0.11600033898351697
+Ethnicity,Not Hispanic,anger,0.38447914105187286
+Ethnicity,Not Hispanic,disgust,0.3805025468945744
+Ethnicity,Not Hispanic,fear,0.39700996816535267
+Ethnicity,Not Hispanic,happy,0.26060265582491315
+Ethnicity,Not Hispanic,sad,0.390639353138836
+Ethnicity,Not Hispanic,surprise,0.1067157413990143
+AgeBracket,20-34,anger,0.31958974275769264
+AgeBracket,20-34,disgust,0.29825615782890197
+AgeBracket,20-34,fear,0.4377975921236716
+AgeBracket,20-34,happy,0.25543722494331655
+AgeBracket,20-34,sad,0.36435074016787455
+AgeBracket,20-34,surprise,0.11071159042892174
+AgeBracket,35-49,anger,0.3908804368249887
+AgeBracket,35-49,disgust,0.33314776457923306
+AgeBracket,35-49,fear,0.4024606438177375
+AgeBracket,35-49,happy,0.20901064858626667
+AgeBracket,35-49,sad,0.38380146719397207
+AgeBracket,35-49,surprise,0.12511751984829875
+AgeBracket,50+,anger,0.4601308294526517
+AgeBracket,50+,disgust,0.5266618585934303
+AgeBracket,50+,fear,0.37161527938882244
+AgeBracket,50+,happy,0.3165846950489461
+AgeBracket,50+,sad,0.42611062635820063
+AgeBracket,50+,surprise,0.08352019049396107
