@@ -29,6 +29,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 import mediapipe as mp
 import numpy as np
 from joblib import load
@@ -92,14 +93,36 @@ FACE_LOST_GRACE_SECONDS = 1.0
 # to keep every prediction.
 ROLLING_WINDOW_FRAMES = 30
 
-_landmarker = FaceLandmarker.create_from_options(
-    FaceLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
-        running_mode=RunningMode.IMAGE,
-        num_faces=1,
-        output_face_blendshapes=True,
+# `history` is capped to the most recent 30 minutes of predictions (as a
+# fixed-size deque) rather than growing forever -- past that horizon every
+# per-tick summary/plot rebuild would otherwise keep getting more expensive
+# for the life of an unattended session, with no benefit since the UI only
+# ever shows/exports "this session so far".
+MAX_HISTORY_SECONDS = 30 * 60
+MAX_HISTORY_FRAMES = int(MAX_HISTORY_SECONDS / STREAM_EVERY_SECONDS)
+
+
+def _new_history():
+    return deque(maxlen=MAX_HISTORY_FRAMES)
+
+
+def _new_landmarker():
+    return FaceLandmarker.create_from_options(
+        FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+            output_face_blendshapes=True,
+        )
     )
-)
+
+
+# A FaceLandmarker is per-session state (created lazily in process_frame),
+# not a module-level singleton: MediaPipe's detector isn't guaranteed
+# thread-safe for concurrent calls, and a shared instance would let two
+# simultaneous browser tabs interfere with each other's detections. The
+# regressor stays shared -- RandomForestRegressor.predict() is a stateless,
+# read-only operation, so concurrent calls across sessions are safe.
 _regressor = load(REGRESSOR_PATH)
 # n_jobs=-1 (set at training time for fitting on the full dataset) makes
 # single-row inference *slower*: joblib pays multiprocess/thread dispatch
@@ -261,8 +284,15 @@ def build_summary_html(stats):
 
 
 def build_peaks_figure(history):
+    # Built via Figure() directly (not plt.subplots()): plt.subplots() would
+    # register the figure in pyplot's global figure manager, which never
+    # gets cleaned up unless something calls plt.close() on it -- and this
+    # runs once a second for the life of the session, so that leak would
+    # accumulate one never-freed Figure per tick. A bare Figure() is never
+    # registered with pyplot in the first place, so there's nothing to leak.
     plt.rcParams["font.family"] = "sans-serif"
-    fig, ax = plt.subplots(figsize=(8, 3.4), dpi=110)
+    fig = Figure(figsize=(8, 3.4), dpi=110)
+    ax = fig.subplots()
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#fafafa")
 
@@ -330,7 +360,6 @@ def export_session_graph(history):
     fig = build_peaks_figure(history)
     fd, path = tempfile.mkstemp(suffix=".png", prefix="emotion_session_graph_")
     fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
     return path
 
 
@@ -339,28 +368,35 @@ def export_session_graph(history):
 # =============================================================================
 
 def process_frame(frame, session_start, history, blendshape_window, last_face_seen,
-                   frame_timestamps, detection_history):
+                   frame_timestamps, detection_history, landmarker):
     if frame is None:
         return (
             None, gr.skip(), gr.skip(), gr.skip(),
             session_start, history, blendshape_window, last_face_seen,
-            frame_timestamps, detection_history,
+            frame_timestamps, detection_history, landmarker,
         )
 
     if session_start is None:
         session_start = time.monotonic()
+    if history is None:
+        history = _new_history()
     if blendshape_window is None:
         blendshape_window = deque()
     if frame_timestamps is None:
         frame_timestamps = deque(maxlen=ROLLING_WINDOW_FRAMES)
     if detection_history is None:
         detection_history = deque(maxlen=ROLLING_WINDOW_FRAMES)
+    if landmarker is None:
+        # Created per session (not a module-level singleton) since a shared
+        # FaceLandmarker isn't guaranteed thread-safe across concurrent
+        # browser sessions -- see the note by _new_landmarker's definition.
+        landmarker = _new_landmarker()
 
     now = time.monotonic()
     frame_timestamps.append(now)  # for FPS -- cheap append/evict, no extra work per frame
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-    result = _landmarker.detect(mp_image)  # unchanged
+    result = landmarker.detect(mp_image)
 
     annotated = frame.copy()
     for face_landmarks in result.face_landmarks:
@@ -388,7 +424,7 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
         return (
             annotated, gr.skip(), status_html, meta_html,
             session_start, history, blendshape_window, last_face_seen,
-            frame_timestamps, detection_history,
+            frame_timestamps, detection_history, landmarker,
         )
 
     if pooled is None:
@@ -397,16 +433,16 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
             return (
                 annotated, gr.skip(), status_html, meta_html,
                 session_start, history, blendshape_window, last_face_seen,
-                frame_timestamps, detection_history,
+                frame_timestamps, detection_history, landmarker,
             )
         return (
             annotated, gr.skip(), gr.skip(), meta_html,
             session_start, history, blendshape_window, last_face_seen,
-            frame_timestamps, detection_history,
+            frame_timestamps, detection_history, landmarker,
         )
 
     intensities = _regressor.predict(pooled)[0]  # unchanged
-    history.append((now - session_start, intensities))  # unchanged
+    history.append((now - session_start, intensities))  # capped via _new_history()'s maxlen
 
     bars_html = build_bars_html(intensities)
     status_html = build_status_html("tracking")
@@ -414,7 +450,7 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
     return (
         annotated, bars_html, status_html, meta_html,
         session_start, history, blendshape_window, last_face_seen,
-        frame_timestamps, detection_history,
+        frame_timestamps, detection_history, landmarker,
     )
 
 
@@ -430,17 +466,23 @@ def refresh_plot(history):
     return build_peaks_figure(history)
 
 
-def reset_session():
-    empty_fig = build_peaks_figure([])
+def reset_session(landmarker):
+    # Close the old per-session landmarker's native resources up front
+    # instead of waiting on garbage collection -- process_frame lazily
+    # creates a fresh one on the next frame.
+    if landmarker is not None:
+        landmarker.close()
+    empty_fig = build_peaks_figure(_new_history())
     return (
-        None, [], None, None, None, None,   # session_start, history, blendshape_window,
-                                              # last_face_seen, frame_timestamps, detection_history
+        None, _new_history(), None, None, None, None, None,
+        # session_start, history, blendshape_window, last_face_seen,
+        # frame_timestamps, detection_history, landmarker
         None,                                # landmarks image
         build_bars_html(np.zeros(len(EMOTIONS))),
         empty_fig,
         build_status_html("calibrating"),
         build_meta_html("Low", 0.15, 0.0),
-        build_summary_html(compute_session_stats([])),
+        build_summary_html(compute_session_stats(_new_history())),
     )
 
 
@@ -528,11 +570,12 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
             theme_toggle_btn = gr.Button("🌓", elem_id="theme-toggle-btn", size="sm")
 
     session_start_state = gr.State(None)
-    history_state = gr.State([])
+    history_state = gr.State(_new_history())
     blendshape_window_state = gr.State(None)
     last_face_seen_state = gr.State(None)
     frame_timestamps_state = gr.State(None)
     detection_history_state = gr.State(None)
+    landmarker_state = gr.State(None)
 
     with gr.Row():
         with gr.Column(scale=1, elem_classes="card"):
@@ -581,12 +624,12 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
         fn=process_frame,
         inputs=[
             cam, session_start_state, history_state, blendshape_window_state, last_face_seen_state,
-            frame_timestamps_state, detection_history_state,
+            frame_timestamps_state, detection_history_state, landmarker_state,
         ],
         outputs=[
             landmarks_out, bars_out, status_out, meta_out,
             session_start_state, history_state, blendshape_window_state, last_face_seen_state,
-            frame_timestamps_state, detection_history_state,
+            frame_timestamps_state, detection_history_state, landmarker_state,
         ],
         stream_every=STREAM_EVERY_SECONDS,
         # Every output of a .stream() handler gets Gradio's default "pending"
@@ -607,9 +650,10 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
 
     reset_btn.click(
         fn=reset_session,
+        inputs=[landmarker_state],
         outputs=[
             session_start_state, history_state, blendshape_window_state, last_face_seen_state,
-            frame_timestamps_state, detection_history_state,
+            frame_timestamps_state, detection_history_state, landmarker_state,
             landmarks_out, bars_out, plot_out, status_out, meta_out, summary_out,
         ],
     )
