@@ -69,6 +69,17 @@ REGRESSOR_PATH = (
 
 # --- Unchanged from prior versions ------------------------------------------
 WINDOW_SECONDS = 0.5
+
+# How often Gradio invokes process_frame, decoupled from WINDOW_SECONDS: the
+# pooling window can stay wide for robustness while the stream itself runs
+# much faster, since each call only has to re-pool a small deque rather than
+# rebuild anything expensive.
+STREAM_EVERY_SECONDS = 0.1
+
+# Rebuilding the peaks figure (matplotlib figure creation + legend + layout)
+# costs ~150-200ms regardless of history size -- far more than detect+predict
+# combined -- so it's driven by its own timer instead of every stream tick.
+PLOT_REFRESH_SECONDS = 1.0
 PEAK_MIN_HEIGHT = 1.0
 PEAK_MIN_PROMINENCE = 0.3
 CALIBRATION_SECONDS = 1.0
@@ -90,6 +101,11 @@ _landmarker = FaceLandmarker.create_from_options(
     )
 )
 _regressor = load(REGRESSOR_PATH)
+# n_jobs=-1 (set at training time for fitting on the full dataset) makes
+# single-row inference *slower*: joblib pays multiprocess/thread dispatch
+# overhead on every predict() call that dwarfs the actual tree traversal.
+# Force in-process sequential prediction for live use (~75ms -> ~25ms/call).
+_regressor.n_jobs = 1
 
 
 # =============================================================================
@@ -326,7 +342,7 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
                    frame_timestamps, detection_history):
     if frame is None:
         return (
-            None, gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+            None, gr.skip(), gr.skip(), gr.skip(),
             session_start, history, blendshape_window, last_face_seen,
             frame_timestamps, detection_history,
         )
@@ -370,7 +386,7 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
     if still_calibrating:
         status_html = build_status_html("calibrating")
         return (
-            annotated, gr.skip(), gr.skip(), status_html, meta_html,
+            annotated, gr.skip(), status_html, meta_html,
             session_start, history, blendshape_window, last_face_seen,
             frame_timestamps, detection_history,
         )
@@ -379,12 +395,12 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
         if face_lost_duration > FACE_LOST_GRACE_SECONDS:
             status_html = build_status_html("lost")
             return (
-                annotated, gr.skip(), gr.skip(), status_html, meta_html,
+                annotated, gr.skip(), status_html, meta_html,
                 session_start, history, blendshape_window, last_face_seen,
                 frame_timestamps, detection_history,
             )
         return (
-            annotated, gr.skip(), gr.skip(), gr.skip(), meta_html,
+            annotated, gr.skip(), gr.skip(), meta_html,
             session_start, history, blendshape_window, last_face_seen,
             frame_timestamps, detection_history,
         )
@@ -393,11 +409,10 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
     history.append((now - session_start, intensities))  # unchanged
 
     bars_html = build_bars_html(intensities)
-    fig = build_peaks_figure(history)
     status_html = build_status_html("tracking")
 
     return (
-        annotated, bars_html, fig, status_html, meta_html,
+        annotated, bars_html, status_html, meta_html,
         session_start, history, blendshape_window, last_face_seen,
         frame_timestamps, detection_history,
     )
@@ -405,6 +420,14 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
 
 def refresh_summary(history):
     return build_summary_html(compute_session_stats(history))
+
+
+def refresh_plot(history):
+    """Runs on its own timer, fully decoupled from the webcam stream --
+    bundling this into process_frame's return meant every stream tick's
+    round trip periodically ballooned while the browser downloaded and
+    rendered the plot image before it could capture the next frame."""
+    return build_peaks_figure(history)
 
 
 def reset_session():
@@ -513,7 +536,28 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
 
     with gr.Row():
         with gr.Column(scale=1, elem_classes="card"):
-            cam = gr.Image(sources=["webcam"], streaming=True, type="numpy", label="Webcam")
+            cam = gr.Image(
+                sources=["webcam"],
+                streaming=True,
+                type="numpy",
+                label="Webcam",
+                # Unconstrained getUserMedia falls back to Gradio's own
+                # default of 1920x1440 -- constraints MUST be nested under a
+                # "video" key to override that default, a flat {"width": ...}
+                # dict is silently ignored. The frontend only takes its NEXT
+                # snapshot once the current round trip (encode -> upload ->
+                # detect/predict -> download) has returned, so a bigger frame
+                # doesn't just cost more compute, it directly stalls the
+                # capture rate.
+                webcam_options=gr.WebcamOptions(
+                    constraints={
+                        "video": {
+                            "width": {"ideal": 480, "max": 640},
+                            "height": {"ideal": 360, "max": 480},
+                        }
+                    }
+                ),
+            )
         with gr.Column(scale=1, elem_classes="card"):
             landmarks_out = gr.Image(type="numpy", label="Landmarks")
 
@@ -540,15 +584,26 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
             frame_timestamps_state, detection_history_state,
         ],
         outputs=[
-            landmarks_out, bars_out, plot_out, status_out, meta_out,
+            landmarks_out, bars_out, status_out, meta_out,
             session_start_state, history_state, blendshape_window_state, last_face_seen_state,
             frame_timestamps_state, detection_history_state,
         ],
-        stream_every=WINDOW_SECONDS,
+        stream_every=STREAM_EVERY_SECONDS,
+        # Every output of a .stream() handler gets Gradio's default "pending"
+        # overlay (a translucent gray pulse) while that call is in flight.
+        # At STREAM_EVERY_SECONDS cadence that overlay toggles on/off ~10x/sec,
+        # which reads as constant flicker on bars_out/status_out/meta_out even
+        # though the underlying values update instantly. Nothing here is slow
+        # enough to need a busy indicator, so hide it instead of showing it on
+        # every frame.
+        show_progress="hidden",
     )
 
     summary_timer = gr.Timer(1.0)
     summary_timer.tick(fn=refresh_summary, inputs=[history_state], outputs=[summary_out])
+
+    plot_timer = gr.Timer(PLOT_REFRESH_SECONDS)
+    plot_timer.tick(fn=refresh_plot, inputs=[history_state], outputs=[plot_out])
 
     reset_btn.click(
         fn=reset_session,
