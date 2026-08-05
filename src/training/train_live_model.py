@@ -27,6 +27,18 @@ for AffectNet's portion, while still doing proper actor-level holdout for
 CREMA-D. Calibration clips are excluded from the split entirely (always
 train) since they exist to patch specific personal/surprise gaps, not to be
 evaluated on.
+
+Calibration clips are windowed rather than reduced to one max-pooled vector
+per clip: test_windowed_augmentation.py found that slicing each clip into
+overlapping 20-frame windows (all windows from a held-out clip excluded
+together, so no leakage) cut leave-one-clip-out MAE from 0.415 to 0.286 and
+fixed a backwards mild/moderate/strong ordering seen with whole-clip pooling.
+It also matches the live app's own inference-time pooling, which maxes over a
+short rolling window (ROLLING_WINDOW_FRAMES in app.py), not an entire clip.
+CREMA-D and AffectNet are NOT windowed here: CREMA-D's raw per-frame scores
+aren't cached (only pooling max is; windowing it would mean re-running
+extract_cremad_features.py over all ~7,400 clips), and AffectNet is single
+static images with no time axis to window.
 """
 
 import os
@@ -56,6 +68,30 @@ MODEL_PATH = os.path.join(MODEL_DIR, "emotion_intensity_regressor_live.joblib")
 TEST_FRACTION = 0.30
 SPLIT_SEED = 42
 
+# See test_windowed_augmentation.py for why calibration clips are windowed
+# instead of max-pooled whole -- must match that script's config exactly for
+# the validated MAE improvement to carry over.
+CALIBRATION_WINDOW_SIZE = 20
+CALIBRATION_WINDOW_STRIDE = 10
+
+
+def window_calibration_clips(raw_sequences, y):
+    """Expand each clip's raw per-frame sequence into overlapping max-pooled windows."""
+    X, Y = [], []
+    for clip_idx, sequence in enumerate(raw_sequences):
+        t = len(sequence)
+        if t <= CALIBRATION_WINDOW_SIZE:
+            windows = [sequence.max(axis=0)]
+        else:
+            windows = [
+                sequence[start:start + CALIBRATION_WINDOW_SIZE].max(axis=0)
+                for start in range(0, t - CALIBRATION_WINDOW_SIZE + 1, CALIBRATION_WINDOW_STRIDE)
+            ]
+        for window_feats in windows:
+            X.append(window_feats)
+            Y.append(y[clip_idx])
+    return np.array(X), np.array(Y)
+
 
 def load_merged():
     cremad = np.load(CREMAD_PATH, allow_pickle=True)
@@ -68,11 +104,15 @@ def load_merged():
         == list(affectnet["feature_names"])
     )
 
-    X = np.vstack([cremad["X"], calibration["X"], affectnet["X"]])
-    y = np.vstack([cremad["y"], calibration["y"], affectnet["y"]])
+    calibration_X, calibration_y = window_calibration_clips(
+        calibration["raw_sequences"], calibration["y"]
+    )
+
+    X = np.vstack([cremad["X"], calibration_X, affectnet["X"]])
+    y = np.vstack([cremad["y"], calibration_y, affectnet["y"]])
     groups = np.concatenate([
         cremad["actor_ids"],
-        np.array(["self"] * len(calibration["X"])),
+        np.array(["self"] * len(calibration_X)),
         np.array([f"affectnet_{i}" for i in range(len(affectnet["X"]))]),
     ])
     return X, y, groups

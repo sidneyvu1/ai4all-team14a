@@ -109,9 +109,6 @@ def main():
     print("\nLabel columns, in order: [sentiment, happy, sad, anger, surprise, disgust, fear]")
 
 
-LABEL_NAMES = ["sentiment", "happy", "sad", "anger", "surprise", "disgust", "fear"]
-
-
 
 if __name__ == "__main__":
     main()

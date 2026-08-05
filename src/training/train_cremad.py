@@ -38,10 +38,15 @@ EVAL_INDICES = [i for i, e in enumerate(EMOTIONS) if e != "surprise"]  # not pre
 TEST_FRACTION = 0.30
 SPLIT_SEED = 42
 
+# Deliberately small: an earlier 3x3 grid (150/250/400 x 15/20/30, 9 configs)
+# found the best config beat model.py's defaults (150, 15) by only 0.003 R2 --
+# within noise, at 2.6x the model size (see train_live_model.py, which skips
+# retuning entirely on that basis). This grid exists to confirm that finding
+# still holds if the data changes, not to search for a real improvement.
 HYPERPARAM_GRID = [
     {"n_estimators": n, "max_depth": d}
-    for n in (150, 250, 400)
-    for d in (15, 20, 30)
+    for n in (150, 250)
+    for d in (15, 20)
 ]
 
 

@@ -35,9 +35,12 @@ from mediapipe.tasks.python.vision import (
     RunningMode,
 )
 
-AFFECTNET_DIR = (
+# Override via AFFECTNET_DIR env var -- the default only exists on the
+# original author's machine (kagglehub's local download cache).
+AFFECTNET_DIR = os.environ.get(
+    "AFFECTNET_DIR",
     r"C:\Users\andys\.cache\kagglehub\datasets\mstjebashazida"
-    r"\affectnet\versions\1\archive (3)"
+    r"\affectnet\versions\1\archive (3)",
 )
 LABELS_CSV = os.path.join(AFFECTNET_DIR, "labels.csv")
 MODEL_PATH = str(Path(__file__).resolve().parents[2] / "src" / "ui" / "assets" / "face_landmarker.task")

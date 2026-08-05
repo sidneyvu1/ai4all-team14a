@@ -5,6 +5,14 @@ seen when training on one max-pooled vector per clip?
 Evaluation is leave-one-CLIP-out (not leave-one-window-out): all windows from
 a held-out clip are excluded from training together, so windows from the same
 recording never leak across the train/test split.
+
+CONCLUSION: yes -- overall LOOCV MAE dropped from 0.415 (train_calibration.py,
+whole-clip pooling) to 0.286 with these exact window/stride settings, and the
+backwards ordering resolved. Folded into the real training pipeline in
+train_live_model.py (window_calibration_clips), which windows the calibration
+slice of the merged live-model training set using this same WINDOW_SIZE/
+STRIDE. This script is kept standalone since it also reports the full
+leave-one-clip-out prediction table, which the merged pipeline doesn't.
 """
 
 import numpy as np

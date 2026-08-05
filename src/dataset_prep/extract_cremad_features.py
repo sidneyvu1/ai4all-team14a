@@ -26,9 +26,12 @@ from extract_calibration_features import (
     extract_frame_scores,
 )
 
-CREMAD_DIR = (
+# Override via CREMAD_DIR env var -- the default only exists on the original
+# author's machine (kagglehub's local download cache).
+CREMAD_DIR = os.environ.get(
+    "CREMAD_DIR",
     r"C:\Users\andys\.cache\kagglehub\datasets\orvile"
-    r"\crema-d-emotional-multimodal-dataset\versions\1\content\CREMA-D\VideoFlash"
+    r"\crema-d-emotional-multimodal-dataset\versions\1\content\CREMA-D\VideoFlash",
 )
 OUTPUT_PATH = "data/cremad_features_full.npz"
 

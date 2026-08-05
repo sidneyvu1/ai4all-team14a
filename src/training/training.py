@@ -1,4 +1,12 @@
-"""Trains the emotion-intensity regressor on the CMU-MOSEI OpenFace2 splits."""
+"""Trains the emotion-intensity regressor on the CMU-MOSEI OpenFace2 splits.
+
+Superseded / not part of the live pipeline: the live app (src/ui/app.py) loads
+emotion_intensity_regressor_live.joblib, trained by train_live_model.py on
+MediaPipe blendshapes. OpenFace2 features (used here) are a different feature
+space that MediaPipe-based live inference can't produce, so this model is
+never loaded at runtime. Kept for reference as the original feature-space
+choice before the switch to MediaPipe.
+"""
 
 import os
 import sys

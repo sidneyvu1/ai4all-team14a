@@ -1,3 +1,6 @@
+# One-off interactive script for inspecting CMU-MOSEI's raw .csd structure.
+# Not part of the shipped pipeline -- run from the repo root if needed.
+
 import h5py
 
 def print_structure(name, obj):
