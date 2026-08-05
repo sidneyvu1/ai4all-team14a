@@ -18,6 +18,7 @@ blendshape pooling -> regressor call -> history/peaks) is still untouched.
 """
 
 import csv
+import os
 import tempfile
 import time
 from collections import deque
@@ -107,10 +108,16 @@ def _new_history():
 
 
 def _new_landmarker():
+    # VIDEO mode (not IMAGE) lets MediaPipe exploit temporal coherence
+    # between consecutive webcam frames instead of redetecting from scratch
+    # every call, which lowers per-frame latency -- the same mode
+    # extract_calibration_features.py already uses for clips. It requires
+    # strictly increasing per-instance timestamps, which process_frame
+    # supplies via a per-session timestamp counter.
     return FaceLandmarker.create_from_options(
         FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
-            running_mode=RunningMode.IMAGE,
+            running_mode=RunningMode.VIDEO,
             num_faces=1,
             output_face_blendshapes=True,
         )
@@ -359,6 +366,7 @@ def export_session_graph(history):
         return None
     fig = build_peaks_figure(history)
     fd, path = tempfile.mkstemp(suffix=".png", prefix="emotion_session_graph_")
+    os.close(fd)  # fig.savefig writes via `path`, not `fd` -- close it to avoid leaking the descriptor
     fig.savefig(path, dpi=150, bbox_inches="tight")
     return path
 
@@ -368,12 +376,12 @@ def export_session_graph(history):
 # =============================================================================
 
 def process_frame(frame, session_start, history, blendshape_window, last_face_seen,
-                   frame_timestamps, detection_history, landmarker):
+                   frame_timestamps, detection_history, landmarker, last_video_timestamp_ms):
     if frame is None:
         return (
             None, gr.skip(), gr.skip(), gr.skip(),
             session_start, history, blendshape_window, last_face_seen,
-            frame_timestamps, detection_history, landmarker,
+            frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
         )
 
     if session_start is None:
@@ -391,16 +399,29 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
         # FaceLandmarker isn't guaranteed thread-safe across concurrent
         # browser sessions -- see the note by _new_landmarker's definition.
         landmarker = _new_landmarker()
+    if last_video_timestamp_ms is None:
+        last_video_timestamp_ms = -1
 
     now = time.monotonic()
     frame_timestamps.append(now)  # for FPS -- cheap append/evict, no extra work per frame
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-    result = landmarker.detect(mp_image)
+    # VIDEO mode requires strictly increasing timestamps for the lifetime of
+    # the landmarker instance. Wall-clock elapsed-ms-since-session-start is
+    # monotonic in practice, but the +1 fallback guards against the
+    # occasional same-millisecond tie between two fast round trips.
+    timestamp_ms = int((now - session_start) * 1000)
+    if timestamp_ms <= last_video_timestamp_ms:
+        timestamp_ms = last_video_timestamp_ms + 1
+    last_video_timestamp_ms = timestamp_ms
+    result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-    annotated = frame.copy()
-    for face_landmarks in result.face_landmarks:
-        annotated = draw_landmarks(annotated, face_landmarks)  # unchanged
+    if result.face_landmarks:
+        annotated = frame.copy()
+        for face_landmarks in result.face_landmarks:
+            annotated = draw_landmarks(annotated, face_landmarks)
+    else:
+        annotated = frame
 
     face_detected = bool(result.face_blendshapes)
     detection_history.append(face_detected)  # for tracking-confidence
@@ -424,7 +445,7 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
         return (
             annotated, gr.skip(), status_html, meta_html,
             session_start, history, blendshape_window, last_face_seen,
-            frame_timestamps, detection_history, landmarker,
+            frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
         )
 
     if pooled is None:
@@ -433,12 +454,12 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
             return (
                 annotated, gr.skip(), status_html, meta_html,
                 session_start, history, blendshape_window, last_face_seen,
-                frame_timestamps, detection_history, landmarker,
+                frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
             )
         return (
             annotated, gr.skip(), gr.skip(), meta_html,
             session_start, history, blendshape_window, last_face_seen,
-            frame_timestamps, detection_history, landmarker,
+            frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
         )
 
     intensities = _regressor.predict(pooled)[0]  # unchanged
@@ -450,7 +471,7 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
     return (
         annotated, bars_html, status_html, meta_html,
         session_start, history, blendshape_window, last_face_seen,
-        frame_timestamps, detection_history, landmarker,
+        frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
     )
 
 
@@ -469,14 +490,16 @@ def refresh_plot(history):
 def reset_session(landmarker):
     # Close the old per-session landmarker's native resources up front
     # instead of waiting on garbage collection -- process_frame lazily
-    # creates a fresh one on the next frame.
+    # creates a fresh one (with its own fresh VIDEO-mode timestamp clock,
+    # since last_video_timestamp_ms is also reset to None here) on the next
+    # frame.
     if landmarker is not None:
         landmarker.close()
     empty_fig = build_peaks_figure(_new_history())
     return (
-        None, _new_history(), None, None, None, None, None,
+        None, _new_history(), None, None, None, None, None, None,
         # session_start, history, blendshape_window, last_face_seen,
-        # frame_timestamps, detection_history, landmarker
+        # frame_timestamps, detection_history, landmarker, last_video_timestamp_ms
         None,                                # landmarks image
         build_bars_html(np.zeros(len(EMOTIONS))),
         empty_fig,
@@ -576,6 +599,7 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
     frame_timestamps_state = gr.State(None)
     detection_history_state = gr.State(None)
     landmarker_state = gr.State(None)
+    last_video_timestamp_state = gr.State(None)
 
     with gr.Row():
         with gr.Column(scale=1, elem_classes="card"):
@@ -624,12 +648,12 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
         fn=process_frame,
         inputs=[
             cam, session_start_state, history_state, blendshape_window_state, last_face_seen_state,
-            frame_timestamps_state, detection_history_state, landmarker_state,
+            frame_timestamps_state, detection_history_state, landmarker_state, last_video_timestamp_state,
         ],
         outputs=[
             landmarks_out, bars_out, status_out, meta_out,
             session_start_state, history_state, blendshape_window_state, last_face_seen_state,
-            frame_timestamps_state, detection_history_state, landmarker_state,
+            frame_timestamps_state, detection_history_state, landmarker_state, last_video_timestamp_state,
         ],
         stream_every=STREAM_EVERY_SECONDS,
         # Every output of a .stream() handler gets Gradio's default "pending"
@@ -653,7 +677,7 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
         inputs=[landmarker_state],
         outputs=[
             session_start_state, history_state, blendshape_window_state, last_face_seen_state,
-            frame_timestamps_state, detection_history_state, landmarker_state,
+            frame_timestamps_state, detection_history_state, landmarker_state, last_video_timestamp_state,
             landmarks_out, bars_out, plot_out, status_out, meta_out, summary_out,
         ],
     )
