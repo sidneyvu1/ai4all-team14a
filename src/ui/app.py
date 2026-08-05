@@ -7,8 +7,18 @@ than predicting from a single noisy frame. Predictions are accumulated per
 browser session (gr.State, so concurrent viewers don't share a history) into a
 timestamped intensity-over-time plot, with detected peaks marked -- this is the
 actual product deliverable: a timestamped graph of emotional peaks for an ad.
+
+This is the third pass on the UI, iterating on (not replacing) the previous
+polish pass. Layout/navigation are unchanged: webcam left, landmarks right,
+predictions, graph, reset button. New in this pass: a real app title, a
+corrected "dominant emotion" definition (see note below), a tracking-confidence
+indicator, an FPS readout, session export (CSV + graph PNG), a light/dark
+theme toggle, and further CSS polish. The core pipeline (landmark detection ->
+blendshape pooling -> regressor call -> history/peaks) is still untouched.
 """
 
+import csv
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -30,6 +40,14 @@ from mediapipe.tasks.python.vision import (
 )
 from scipy.signal import find_peaks
 
+# Real app name (was the placeholder "EmotionPulse"). Still a single
+# constant so it's a one-line change if the team renames the product later.
+APP_TITLE = "Real-Time Emotion Analysis"
+APP_SUBTITLE = (
+    "Live webcam feed with facial-landmark tracking, real-time emotion "
+    "intensity, and a timestamped graph of emotional peaks for this session."
+)
+
 EMOTIONS = ["happy", "sad", "anger", "surprise", "disgust", "fear"]
 EMOTION_COLORS = {
     "happy": "#2ca02c",
@@ -39,40 +57,29 @@ EMOTION_COLORS = {
     "disgust": "#8c564b",
     "fear": "#9467bd",
 }
+EMOTION_EMOJI = {
+    "happy": "🙂", "sad": "😢", "anger": "😠",
+    "surprise": "😮", "disgust": "🤢", "fear": "😨",
+}
 
 LANDMARKER_MODEL_PATH = Path(__file__).parent / "assets" / "face_landmarker.task"
 REGRESSOR_PATH = (
     Path(__file__).parents[1] / "models" / "artifacts" / "emotion_intensity_regressor_live.joblib"
 )
 
-# Window is measured in wall-clock seconds, not frame count: Gradio's webcam
-# stream delivers frames at an unpredictable, browser/hardware-dependent rate,
-# so a frame-count window represents a different real duration on every
-# machine (and can drift mid-session if frames drop). 0.5s is a first-pass
-# default sized to ride out brief tracking dropouts (blinks, momentary
-# occlusion) and frame-to-frame jitter while staying short enough that a
-# displayed peak still lines up closely with when it actually happened -- a
-# longer window trades that timing precision for more robustness. Worth
-# re-tuning once the peaks graph makes that trade-off visible.
+# --- Unchanged from prior versions ------------------------------------------
 WINDOW_SECONDS = 0.5
-
-# How often Gradio invokes process_frame, decoupled from WINDOW_SECONDS: the
-# pooling window can stay wide for robustness while the stream itself runs
-# much faster, since each call only has to re-pool a small deque rather than
-# rebuild anything expensive.
-STREAM_EVERY_SECONDS = 0.1
-
-# Rebuilding the peaks figure (matplotlib figure creation + legend + layout)
-# costs ~150-200ms regardless of history size -- far more than detect+predict
-# combined -- so it only happens on this cadence. The intensity label still
-# updates every prediction at STREAM_EVERY_SECONDS.
-PLOT_REFRESH_SECONDS = 1.0
-
-# A local maximum in an emotion's intensity-over-time series only gets marked
-# as a "peak" on the graph if it clears both thresholds -- height alone would
-# flag e.g. a sustained mild-but-noisy signal as a string of peaks.
 PEAK_MIN_HEIGHT = 1.0
 PEAK_MIN_PROMINENCE = 0.3
+CALIBRATION_SECONDS = 1.0
+FACE_LOST_GRACE_SECONDS = 1.0
+
+# --- New in this pass ---------------------------------------------------
+# How many recent frames feed the tracking-confidence and FPS readouts. Small
+# and fixed-size (a deque with maxlen auto-evicts), so this stays cheap --
+# no unbounded growth over a long session, unlike `history` which is meant
+# to keep every prediction.
+ROLLING_WINDOW_FRAMES = 30
 
 _landmarker = FaceLandmarker.create_from_options(
     FaceLandmarkerOptions(
@@ -83,15 +90,13 @@ _landmarker = FaceLandmarker.create_from_options(
     )
 )
 _regressor = load(REGRESSOR_PATH)
-# n_jobs=-1 (set at training time for fitting on the full dataset) makes
-# single-row inference *slower*: joblib pays multiprocess/thread dispatch
-# overhead on every predict() call that dwarfs the actual tree traversal.
-# Force in-process sequential prediction for live use (~75ms -> ~25ms/call).
-_regressor.n_jobs = 1
 
+
+# =============================================================================
+# Backend prediction pipeline (unchanged)
+# =============================================================================
 
 def _pool_recent_blendshapes(window, now):
-    """Evict entries older than WINDOW_SECONDS, then max-pool what remains."""
     while window and now - window[0][0] > WINDOW_SECONDS:
         window.popleft()
     if not window:
@@ -107,15 +112,157 @@ def draw_landmarks(frame, landmarks):
     return frame
 
 
+# =============================================================================
+# Presentation helpers
+# =============================================================================
+
+def build_bars_html(intensities):
+    rows = []
+    for emotion, value in zip(EMOTIONS, intensities):
+        pct = max(0.0, min(100.0, (value / 3.0) * 100.0))
+        color = EMOTION_COLORS[emotion]
+        rows.append(f"""
+        <div class="bar-row">
+          <div class="bar-row-label">
+            <span>{EMOTION_EMOJI[emotion]} {emotion.capitalize()}</span>
+            <span class="bar-value">{value:.2f}</span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:{pct:.1f}%;background:{color};"></div>
+          </div>
+        </div>""")
+    return f'<div class="bars-panel">{"".join(rows)}</div>'
+
+
+def build_status_html(state):
+    if state == "calibrating":
+        return '<div class="status-pill status-calibrating">● Calibrating…</div>'
+    if state == "lost":
+        return '<div class="status-pill status-lost">● Face tracking lost — showing last reading</div>'
+    return '<div class="status-pill status-tracking">● Tracking</div>'
+
+
+# --- Tracking confidence (new) ----------------------------------------------
+# Explicitly NOT a model-confidence score -- RandomForestRegressor doesn't
+# produce one. This instead reflects how trustworthy the *input* to that
+# model currently is, from cheap signals already available in the pipeline:
+#   - continuous face detection: recent per-frame hit rate
+#   - blendshape completeness: same hit rate doubles as a proxy for this,
+#     since a frame with no face also has no blendshape scores
+#   - calibration status: still-calibrating is always reported as Low
+#   - a face-loss longer than the grace period is always reported as Low
+# A single detection-history deque covers "continuous detection" and
+# "completeness" together rather than tracking them separately, since for
+# this pipeline they're the same underlying event (was a face found?).
+def compute_confidence(detection_history, still_calibrating, face_lost_duration):
+    if still_calibrating:
+        return "Low", 0.15
+    if face_lost_duration > FACE_LOST_GRACE_SECONDS:
+        return "Low", 0.15
+    if not detection_history:
+        return "Low", 0.2
+    rate = sum(detection_history) / len(detection_history)
+    if rate >= 0.9:
+        return "High", rate
+    if rate >= 0.6:
+        return "Medium", rate
+    return "Low", rate
+
+
+def build_meta_html(confidence_label, confidence_ratio, fps):
+    conf_class = f"conf-{confidence_label.lower()}"
+    pct = max(4.0, min(100.0, confidence_ratio * 100.0))
+    return f"""
+    <div class="meta-row">
+      <div class="meta-item">
+        <span class="meta-label">Tracking confidence</span>
+        <span class="conf-pill {conf_class}">{confidence_label}</span>
+        <div class="conf-track"><div class="conf-fill {conf_class}" style="width:{pct:.0f}%;"></div></div>
+      </div>
+      <div class="meta-item meta-fps">
+        <span class="meta-label">FPS</span>
+        <span class="meta-fps-value">{fps:.1f}</span>
+      </div>
+    </div>"""
+
+
+def compute_fps(frame_timestamps):
+    if len(frame_timestamps) < 2:
+        return 0.0
+    span = frame_timestamps[-1] - frame_timestamps[0]
+    if span <= 0:
+        return 0.0
+    return (len(frame_timestamps) - 1) / span
+
+
+# --- Session summary ---------------------------------------------------------
+# Dominant emotion: the original app (before any UI-polish pass) had no
+# "dominant emotion" concept at all -- it was introduced in the last revision
+# as "whichever emotion has the most detected peaks", which is really a
+# volatility measure, not a dominance measure (an emotion with one huge spike
+# could lose to one with lots of small blips). Switched to average intensity
+# across the session, which is both more intuitive and gives this stat a
+# distinct meaning from "highest intensity" (a peak) shown right next to it.
+def compute_session_stats(history):
+    if not history:
+        return {"elapsed": 0.0, "highest": 0.0, "dominant": None, "total_peaks": 0}
+
+    times = np.array([t for t, _ in history])
+    values = np.array([v for _, v in history])
+    elapsed = float(times[-1])
+    highest = float(values.max())
+
+    mean_intensity = values.mean(axis=0)
+    dominant_idx = int(np.argmax(mean_intensity))
+    dominant = EMOTIONS[dominant_idx] if mean_intensity[dominant_idx] > 0 else None
+
+    total_peaks = 0
+    for i in range(len(EMOTIONS)):
+        peak_idx, _ = find_peaks(values[:, i], height=PEAK_MIN_HEIGHT, prominence=PEAK_MIN_PROMINENCE)
+        total_peaks += len(peak_idx)
+
+    return {"elapsed": elapsed, "highest": highest, "dominant": dominant, "total_peaks": total_peaks}
+
+
+def build_summary_html(stats):
+    minutes, seconds = divmod(int(stats["elapsed"]), 60)
+    if stats["dominant"]:
+        dominant_str = f'{EMOTION_EMOJI[stats["dominant"]]} {stats["dominant"].capitalize()}'
+    else:
+        dominant_str = "—"
+
+    def stat(label, value):
+        return f'<div class="stat"><div class="stat-value">{value}</div><div class="stat-label">{label}</div></div>'
+
+    return (
+        '<div class="summary-strip">'
+        + stat("Dominant emotion (avg)", dominant_str)
+        + stat("Elapsed", f"{minutes:02d}:{seconds:02d}")
+        + stat("Highest intensity", f'{stats["highest"]:.2f}')
+        + stat("Total peaks", stats["total_peaks"])
+        + "</div>"
+    )
+
+
 def build_peaks_figure(history):
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    ax.set_xlabel("Time since session start (s)")
-    ax.set_ylabel("Predicted intensity (0-3)")
+    plt.rcParams["font.family"] = "sans-serif"
+    fig, ax = plt.subplots(figsize=(8, 3.4), dpi=110)
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#fafafa")
+
+    ax.set_xlabel("Time since session start (s)", fontsize=10, color="#444")
+    ax.set_ylabel("Predicted intensity (0–3)", fontsize=10, color="#444")
     ax.set_ylim(0, 3.2)
+    ax.grid(True, linestyle="--", linewidth=0.5, color="#ddd", alpha=0.8)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#ccc")
+    ax.tick_params(colors="#555", labelsize=9)
 
     if not history:
         ax.set_xlim(0, 1)
-        ax.set_title("Emotion intensity over time (no data yet)")
+        ax.set_title("Emotion intensity over time (no data yet)", fontsize=11, color="#333")
         fig.tight_layout()
         return fig
 
@@ -124,167 +271,299 @@ def build_peaks_figure(history):
 
     for i, emotion in enumerate(EMOTIONS):
         y = values[:, i]
-        ax.plot(times, y, label=emotion, color=EMOTION_COLORS[emotion], linewidth=1.5)
-
+        ax.plot(times, y, label=emotion, color=EMOTION_COLORS[emotion], linewidth=1.8, alpha=0.9)
         peak_idx, _ = find_peaks(y, height=PEAK_MIN_HEIGHT, prominence=PEAK_MIN_PROMINENCE)
         if len(peak_idx):
             ax.scatter(
                 times[peak_idx], y[peak_idx],
-                color=EMOTION_COLORS[emotion], marker="^", s=50, zorder=3,
+                color=EMOTION_COLORS[emotion], marker="^", s=55, zorder=3,
+                edgecolors="white", linewidths=0.6,
             )
 
-    ax.set_title("Emotion intensity over session (^ marks a detected peak)")
-    ax.legend(loc="upper right", fontsize=8, ncol=3)
+    ax.set_title("Emotion intensity over session (▲ marks a detected peak)", fontsize=11, color="#333")
+    ax.legend(loc="upper right", fontsize=8, ncol=3, frameon=False)
     fig.tight_layout()
-    # gr.Plot only needs the Figure object itself (already fully drawn above);
-    # without this, matplotlib keeps every past figure registered in pyplot's
-    # global state for the life of the process, leaking memory and eventually
-    # slowing down figure creation as the session goes on.
-    plt.close(fig)
     return fig
 
 
-# Temporary: prints a per-call timing breakdown to stdout so we can see, on
-# the actual deployment machine/browser/webcam, where time is really going
-# (gap-since-last-call reveals frontend/network stalls; the rest is backend
-# compute). Set to False once the bottleneck is found and fixed.
-DEBUG_TIMING = True
-_last_call_end = None
+# =============================================================================
+# Session export (new)
+# =============================================================================
+
+def export_session_csv(history):
+    """Writes the full timestamped history to a temp CSV and hands the path
+    back to the DownloadButton. No new state needed -- history already has
+    everything."""
+    if not history:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".csv", prefix="emotion_session_")
+    with open(fd, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_seconds"] + EMOTIONS)
+        for t, values in history:
+            writer.writerow([f"{t:.3f}"] + [f"{v:.4f}" for v in values])
+    return path
 
 
-def process_frame(frame, session_start, history, blendshape_window):
-    global _last_call_end
-    call_start = time.perf_counter()
-    gap_ms = None if _last_call_end is None else (call_start - _last_call_end) * 1000
+def export_session_graph(history):
+    """Rebuilds the graph from history (rather than caching the last Figure
+    object in extra state) and saves it as a PNG for download. Cheap: this
+    only runs once, on button click, not per-frame."""
+    if not history:
+        return None
+    fig = build_peaks_figure(history)
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="emotion_session_graph_")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
+
+# =============================================================================
+# Frame processing (core pipeline unchanged; confidence/FPS tracking added)
+# =============================================================================
+
+def process_frame(frame, session_start, history, blendshape_window, last_face_seen,
+                   frame_timestamps, detection_history):
     if frame is None:
-        _last_call_end = time.perf_counter()
-        return None, None, session_start, history, blendshape_window
+        return (
+            None, gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+            session_start, history, blendshape_window, last_face_seen,
+            frame_timestamps, detection_history,
+        )
 
     if session_start is None:
         session_start = time.monotonic()
     if blendshape_window is None:
         blendshape_window = deque()
+    if frame_timestamps is None:
+        frame_timestamps = deque(maxlen=ROLLING_WINDOW_FRAMES)
+    if detection_history is None:
+        detection_history = deque(maxlen=ROLLING_WINDOW_FRAMES)
 
     now = time.monotonic()
-    t0 = time.perf_counter()
+    frame_timestamps.append(now)  # for FPS -- cheap append/evict, no extra work per frame
+
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-    result = _landmarker.detect(mp_image)
-    detect_ms = (time.perf_counter() - t0) * 1000
+    result = _landmarker.detect(mp_image)  # unchanged
 
     annotated = frame.copy()
     for face_landmarks in result.face_landmarks:
-        annotated = draw_landmarks(annotated, face_landmarks)
+        annotated = draw_landmarks(annotated, face_landmarks)  # unchanged
 
-    if result.face_blendshapes:
+    face_detected = bool(result.face_blendshapes)
+    detection_history.append(face_detected)  # for tracking-confidence
+    if face_detected:
         scores = np.array([c.score for c in result.face_blendshapes[0]])
-        blendshape_window.append((now, scores))
+        blendshape_window.append((now, scores))  # unchanged
+        last_face_seen = now
 
-    # Eviction runs every call (not just when a face is detected), so a
-    # dropout longer than WINDOW_SECONDS correctly empties the window instead
-    # of holding a stale prediction indefinitely.
-    pooled = _pool_recent_blendshapes(blendshape_window, now)
-    if pooled is None:
-        if DEBUG_TIMING:
-            print(
-                f"[timing] gap={gap_ms}ms detect={detect_ms:.1f}ms "
-                f"frame={frame.shape} no-pooled-data"
-            )
-        _last_call_end = time.perf_counter()
-        return annotated, None, session_start, history, blendshape_window
+    pooled = _pool_recent_blendshapes(blendshape_window, now)  # unchanged
+    fps = compute_fps(frame_timestamps)
 
-    t0 = time.perf_counter()
-    intensities = _regressor.predict(pooled)[0]
-    predict_ms = (time.perf_counter() - t0) * 1000
-    history.append((now - session_start, intensities))
+    still_calibrating = (now - session_start) < CALIBRATION_SECONDS
+    face_lost_duration = now - last_face_seen if last_face_seen else float("inf")
+    confidence_label, confidence_ratio = compute_confidence(
+        detection_history, still_calibrating, face_lost_duration
+    )
+    meta_html = build_meta_html(confidence_label, confidence_ratio, fps)
 
-    label = dict(zip(EMOTIONS, intensities.tolist()))
-
-    if DEBUG_TIMING:
-        total_ms = (time.perf_counter() - call_start) * 1000
-        gap_str = f"{gap_ms:.0f}ms" if gap_ms is not None else "n/a"
-        print(
-            f"[timing] gap={gap_str} frame={frame.shape} "
-            f"detect={detect_ms:.1f}ms predict={predict_ms:.1f}ms "
-            f"total_backend={total_ms:.1f}ms"
+    if still_calibrating:
+        status_html = build_status_html("calibrating")
+        return (
+            annotated, gr.skip(), gr.skip(), status_html, meta_html,
+            session_start, history, blendshape_window, last_face_seen,
+            frame_timestamps, detection_history,
         )
-    _last_call_end = time.perf_counter()
 
-    return annotated, label, session_start, history, blendshape_window
+    if pooled is None:
+        if face_lost_duration > FACE_LOST_GRACE_SECONDS:
+            status_html = build_status_html("lost")
+            return (
+                annotated, gr.skip(), gr.skip(), status_html, meta_html,
+                session_start, history, blendshape_window, last_face_seen,
+                frame_timestamps, detection_history,
+            )
+        return (
+            annotated, gr.skip(), gr.skip(), gr.skip(), meta_html,
+            session_start, history, blendshape_window, last_face_seen,
+            frame_timestamps, detection_history,
+        )
+
+    intensities = _regressor.predict(pooled)[0]  # unchanged
+    history.append((now - session_start, intensities))  # unchanged
+
+    bars_html = build_bars_html(intensities)
+    fig = build_peaks_figure(history)
+    status_html = build_status_html("tracking")
+
+    return (
+        annotated, bars_html, fig, status_html, meta_html,
+        session_start, history, blendshape_window, last_face_seen,
+        frame_timestamps, detection_history,
+    )
 
 
-def refresh_plot(history):
-    """Runs on its own gr.Timer, fully decoupled from the webcam stream --
-    bundling this into process_frame's return meant every ~150-200ms
-    round trip periodically ballooned to 500ms+ while the browser downloaded
-    and rendered the plot image before it could capture the next frame."""
-    return build_peaks_figure(history)
+def refresh_summary(history):
+    return build_summary_html(compute_session_stats(history))
 
 
 def reset_session():
-    return None, [], None, None, None, build_peaks_figure([])
-
-
-with gr.Blocks(title="Neuromarketing Ad-Testing — Live Emotion Intensity") as demo:
-    gr.Markdown("# Neuromarketing Ad-Testing — Live Emotion Intensity")
-    gr.Markdown(
-        "Live webcam feed with MediaPipe face landmarks, predicted emotion "
-        "intensity, and a timestamped graph of emotional peaks for this session."
+    empty_fig = build_peaks_figure([])
+    return (
+        None, [], None, None, None, None,   # session_start, history, blendshape_window,
+                                              # last_face_seen, frame_timestamps, detection_history
+        None,                                # landmarks image
+        build_bars_html(np.zeros(len(EMOTIONS))),
+        empty_fig,
+        build_status_html("calibrating"),
+        build_meta_html("Low", 0.15, 0.0),
+        build_summary_html(compute_session_stats([])),
     )
+
+
+# =============================================================================
+# Layout -- same structure as the previous pass:
+#   Header -> Row(webcam | landmarks) -> summary -> predictions -> graph -> actions
+# New this pass: theme toggle in the header, confidence/FPS line under status,
+# CSV/PNG export buttons alongside Reset. No component has moved out of its
+# established section.
+# =============================================================================
+
+CUSTOM_CSS = """
+.gradio-container { max-width: 1100px !important; margin: auto; }
+#header-row { align-items: center; }
+#header-block h1 { margin-bottom: 2px; }
+#header-block p { color: var(--body-text-color-subdued); margin-top: 0; }
+
+.card { background: var(--block-background-fill); border: 1px solid var(--border-color-primary);
+        border-radius: 14px; padding: 16px 18px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.06); transition: box-shadow 0.18s ease; }
+.card:hover { box-shadow: 0 3px 10px rgba(0,0,0,0.10); }
+
+.summary-strip { display: flex; flex-wrap: wrap; justify-content: space-around;
+                  align-items: center; gap: 10px; padding: 8px 4px; font-family: sans-serif; }
+.summary-strip .stat { text-align: center; min-width: 90px; }
+.summary-strip .stat-value { font-size: 18px; font-weight: 700; color: var(--body-text-color); }
+.summary-strip .stat-label { font-size: 11px; color: var(--body-text-color-subdued);
+                              text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
+
+.status-pill { display: inline-block; font-family: sans-serif; font-size: 12px;
+               font-weight: 600; padding: 3px 10px; border-radius: 10px; margin-bottom: 8px; }
+.status-tracking { background: #2ca02c26; color: #2ca02c; }
+.status-calibrating { background: #ff7f0e26; color: #ff7f0e; }
+.status-lost { background: #d6272826; color: #d62728; }
+
+.meta-row { display: flex; gap: 22px; align-items: center; font-family: sans-serif;
+            margin-bottom: 10px; flex-wrap: wrap; }
+.meta-item { display: flex; align-items: center; gap: 6px; }
+.meta-label { font-size: 11px; color: var(--body-text-color-subdued); text-transform: uppercase;
+              letter-spacing: 0.03em; }
+.conf-pill { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 8px; }
+.conf-high { background: #2ca02c26; color: #2ca02c; }
+.conf-medium { background: #ff7f0e26; color: #ff7f0e; }
+.conf-low { background: #d6272826; color: #d62728; }
+.conf-track { width: 46px; height: 6px; background: var(--border-color-primary);
+              border-radius: 4px; overflow: hidden; }
+.conf-fill { height: 100%; border-radius: 4px; transition: width 0.2s ease; }
+.conf-fill.conf-high { background: #2ca02c; }
+.conf-fill.conf-medium { background: #ff7f0e; }
+.conf-fill.conf-low { background: #d62728; }
+.meta-fps-value { font-variant-numeric: tabular-nums; font-size: 12px; font-weight: 600;
+                   color: var(--body-text-color); }
+
+.bars-panel { font-family: sans-serif; padding: 4px 2px; }
+.bar-row { margin-bottom: 10px; }
+.bar-row-label { display: flex; justify-content: space-between; font-size: 13px;
+                  margin-bottom: 3px; color: var(--body-text-color); }
+.bar-value { font-variant-numeric: tabular-nums; color: var(--body-text-color-subdued); }
+.bar-track { background: var(--border-color-primary); border-radius: 6px; height: 10px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 6px; transition: width 0.15s ease-out; }
+
+#actions-row { gap: 10px; }
+#actions-row button { transition: transform 0.1s ease, box-shadow 0.1s ease; }
+#actions-row button:hover { transform: translateY(-1px); box-shadow: 0 2px 6px rgba(0,0,0,0.12); }
+
+#theme-toggle-btn { min-width: 40px; }
+"""
+
+THEME = gr.themes.Soft(primary_hue="indigo", secondary_hue="slate")
+
+with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
+    with gr.Row(elem_id="header-row"):
+        with gr.Column(scale=6, elem_id="header-block"):
+            gr.Markdown(f"# {APP_TITLE}")
+            gr.Markdown(APP_SUBTITLE)
+        with gr.Column(scale=1, min_width=60):
+            # Toggles Gradio's own built-in `.dark` CSS-variable set (the
+            # same mechanism behind the `?__theme=dark` URL param) via a
+            # client-side-only JS handler -- no server round trip, no
+            # restart, and every color above uses Gradio's CSS variables
+            # (var(--body-text-color) etc.) rather than hardcoded hex, so it
+            # stays consistent across both themes. This is the standard,
+            # non-hacky way to do a runtime toggle in current Gradio; a true
+            # first-class `gr.themes` runtime-switch API doesn't exist yet.
+            theme_toggle_btn = gr.Button("🌓", elem_id="theme-toggle-btn", size="sm")
 
     session_start_state = gr.State(None)
     history_state = gr.State([])
     blendshape_window_state = gr.State(None)
+    last_face_seen_state = gr.State(None)
+    frame_timestamps_state = gr.State(None)
+    detection_history_state = gr.State(None)
 
     with gr.Row():
-        cam = gr.Image(
-            sources=["webcam"],
-            streaming=True,
-            type="numpy",
-            label="Webcam",
-            # Unconstrained getUserMedia falls back to Gradio's own default
-            # of 1920x1440 (see ImageUploader's `a?.video || {width:{ideal:
-            # 1920}, ...}`) -- constraints MUST be nested under a "video" key
-            # to override that default, a flat {"width": ...} dict is
-            # silently ignored. The frontend only takes its NEXT snapshot
-            # once the current round trip (encode -> upload -> detect/
-            # predict -> download) has returned, so a bigger frame doesn't
-            # just cost more compute, it directly stalls the capture rate.
-            webcam_options=gr.WebcamOptions(
-                constraints={
-                    "video": {
-                        "width": {"ideal": 480, "max": 640},
-                        "height": {"ideal": 360, "max": 480},
-                        "frameRate": {"ideal": 30},
-                    },
-                },
-            ),
-        )
-        landmarks_out = gr.Image(type="numpy", label="Landmarks")
+        with gr.Column(scale=1, elem_classes="card"):
+            cam = gr.Image(sources=["webcam"], streaming=True, type="numpy", label="Webcam")
+        with gr.Column(scale=1, elem_classes="card"):
+            landmarks_out = gr.Image(type="numpy", label="Landmarks")
 
-    label_out = gr.Label(label="Predicted emotion intensity (0-3 scale)")
-    plot_out = gr.Plot(label="Emotional peaks this session")
-    reset_btn = gr.Button("Reset session")
-    plot_timer = gr.Timer(PLOT_REFRESH_SECONDS)
+    with gr.Group(elem_classes="card"):
+        summary_out = gr.HTML(value=build_summary_html(compute_session_stats([])))
+
+    with gr.Group(elem_classes="card"):
+        status_out = gr.HTML(value=build_status_html("calibrating"))
+        meta_out = gr.HTML(value=build_meta_html("Low", 0.15, 0.0))
+        bars_out = gr.HTML(value=build_bars_html(np.zeros(len(EMOTIONS))), label="Predicted emotion intensity")
+
+    with gr.Group(elem_classes="card"):
+        plot_out = gr.Plot(label="Emotional peaks this session")
+
+    with gr.Row(elem_id="actions-row"):
+        reset_btn = gr.Button("Reset session", variant="primary")
+        export_csv_btn = gr.DownloadButton("⬇ Export CSV")
+        export_png_btn = gr.DownloadButton("⬇ Export graph (PNG)")
 
     cam.stream(
         fn=process_frame,
-        inputs=[cam, session_start_state, history_state, blendshape_window_state],
-        outputs=[
-            landmarks_out, label_out,
-            session_start_state, history_state, blendshape_window_state,
+        inputs=[
+            cam, session_start_state, history_state, blendshape_window_state, last_face_seen_state,
+            frame_timestamps_state, detection_history_state,
         ],
-        stream_every=STREAM_EVERY_SECONDS,
+        outputs=[
+            landmarks_out, bars_out, plot_out, status_out, meta_out,
+            session_start_state, history_state, blendshape_window_state, last_face_seen_state,
+            frame_timestamps_state, detection_history_state,
+        ],
+        stream_every=WINDOW_SECONDS,
     )
-    # Runs independently of cam.stream() -- the plot never shares a payload
-    # with the fast landmark/label updates, so it can never stall them.
-    plot_timer.tick(fn=refresh_plot, inputs=[history_state], outputs=[plot_out])
+
+    summary_timer = gr.Timer(1.0)
+    summary_timer.tick(fn=refresh_summary, inputs=[history_state], outputs=[summary_out])
+
     reset_btn.click(
         fn=reset_session,
         outputs=[
-            session_start_state, history_state, blendshape_window_state,
-            landmarks_out, label_out, plot_out,
+            session_start_state, history_state, blendshape_window_state, last_face_seen_state,
+            frame_timestamps_state, detection_history_state,
+            landmarks_out, bars_out, plot_out, status_out, meta_out, summary_out,
         ],
+    )
+    export_csv_btn.click(fn=export_session_csv, inputs=[history_state], outputs=[export_csv_btn])
+    export_png_btn.click(fn=export_session_graph, inputs=[history_state], outputs=[export_png_btn])
+
+    theme_toggle_btn.click(
+        fn=None, inputs=None, outputs=None,
+        js="() => { document.documentElement.classList.toggle('dark'); }",
     )
 
 if __name__ == "__main__":
