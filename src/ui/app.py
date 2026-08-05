@@ -24,6 +24,10 @@ import time
 from collections import deque
 from pathlib import Path
 
+# Set environment variables for headless/server environment before importing MediaPipe
+# This prevents MediaPipe from trying to use GPU acceleration or graphics libraries
+os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+
 import cv2
 import gradio as gr
 import matplotlib
@@ -130,14 +134,24 @@ def _new_landmarker():
     # extract_calibration_features.py already uses for clips. It requires
     # strictly increasing per-instance timestamps, which process_frame
     # supplies via a per-session timestamp counter.
-    return FaceLandmarker.create_from_options(
-        FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
-            running_mode=RunningMode.VIDEO,
-            num_faces=1,
-            output_face_blendshapes=True,
+    try:
+        print(f"Initializing FaceLandmarker with model at {LANDMARKER_MODEL_PATH}", flush=True)
+        return FaceLandmarker.create_from_options(
+            FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
+                running_mode=RunningMode.VIDEO,
+                num_faces=1,
+                output_face_blendshapes=True,
+            )
         )
-    )
+    except Exception as e:
+        print(f"ERROR initializing FaceLandmarker: {e}", flush=True)
+        print(f"Model path exists: {LANDMARKER_MODEL_PATH.exists()}", flush=True)
+        if LANDMARKER_MODEL_PATH.exists():
+            print(f"Model size: {LANDMARKER_MODEL_PATH.stat().st_size} bytes", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 # A FaceLandmarker is per-session state (created lazily in process_frame),
