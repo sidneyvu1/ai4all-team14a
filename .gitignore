@@ -1,8 +1,10 @@
 data/
 *.npz
 *.csd
-src/models/artifacts/
+src/models/artifacts/*
 *.joblib
+# The one artifact the live app needs — shipped via Git LFS (see .gitattributes)
+!src/models/artifacts/emotion_intensity_regressor_live.joblib
 # Environments
 venv/
 .env
