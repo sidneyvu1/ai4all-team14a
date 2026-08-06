@@ -1,7 +1,7 @@
 # Team 14a AI4ALL Project
 
 ## Members
-Andy Sosa, Sidney Vu
+Andy Sosa, Sidney Vu, Lindsay Jarrett, Rocelyn Young, Umma Maisun
 
 ## About
 
