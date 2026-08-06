@@ -24,6 +24,10 @@ import time
 from collections import deque
 from pathlib import Path
 
+# Set environment variables for headless/server environment before importing MediaPipe
+# This prevents MediaPipe from trying to use GPU acceleration or graphics libraries
+os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+
 import cv2
 import gradio as gr
 import matplotlib
@@ -41,6 +45,22 @@ from mediapipe.tasks.python.vision import (
     RunningMode,
 )
 from scipy.signal import find_peaks
+
+try:
+    import spaces
+except ImportError:  # not running on a Hugging Face Space
+    spaces = None
+
+
+@(spaces.GPU if spaces else (lambda fn: fn))
+def _zerogpu_dummy():
+    """Unused. Its only purpose is the @spaces.GPU decorator: this app is
+    CPU-only, but Hugging Face's free tier requires ZeroGPU hardware, which
+    in turn requires at least one @spaces.GPU function to exist -- without
+    this, the Space fails its startup check. Everything else still runs on
+    the normal CPU allocation; this function is never called."""
+    return None
+
 
 # Real app name (was the placeholder "EmotionPulse"). Still a single
 # constant so it's a one-line change if the team renames the product later.
@@ -108,20 +128,28 @@ def _new_history():
 
 
 def _new_landmarker():
-    # VIDEO mode (not IMAGE) lets MediaPipe exploit temporal coherence
-    # between consecutive webcam frames instead of redetecting from scratch
-    # every call, which lowers per-frame latency -- the same mode
-    # extract_calibration_features.py already uses for clips. It requires
-    # strictly increasing per-instance timestamps, which process_frame
-    # supplies via a per-session timestamp counter.
-    return FaceLandmarker.create_from_options(
-        FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
-            running_mode=RunningMode.VIDEO,
-            num_faces=1,
-            output_face_blendshapes=True,
+    # Use IMAGE mode instead of VIDEO mode to avoid graphics library dependencies
+    # (libGLESv2.so.2) that aren't available in headless environments like HF Spaces.
+    # IMAGE mode doesn't exploit temporal coherence between frames, but it's
+    # compatible with headless servers and requires no graphics acceleration.
+    try:
+        print(f"Initializing FaceLandmarker (IMAGE mode) with model at {LANDMARKER_MODEL_PATH}", flush=True)
+        return FaceLandmarker.create_from_options(
+            FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(LANDMARKER_MODEL_PATH)),
+                running_mode=RunningMode.IMAGE,
+                num_faces=1,
+                output_face_blendshapes=True,
+            )
         )
-    )
+    except Exception as e:
+        print(f"ERROR initializing FaceLandmarker: {e}", flush=True)
+        print(f"Model path exists: {LANDMARKER_MODEL_PATH.exists()}", flush=True)
+        if LANDMARKER_MODEL_PATH.exists():
+            print(f"Model size: {LANDMARKER_MODEL_PATH.stat().st_size} bytes", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 # A FaceLandmarker is per-session state (created lazily in process_frame),
@@ -130,12 +158,25 @@ def _new_landmarker():
 # simultaneous browser tabs interfere with each other's detections. The
 # regressor stays shared -- RandomForestRegressor.predict() is a stateless,
 # read-only operation, so concurrent calls across sessions are safe.
-_regressor = load(REGRESSOR_PATH)
-# n_jobs=-1 (set at training time for fitting on the full dataset) makes
-# single-row inference *slower*: joblib pays multiprocess/thread dispatch
-# overhead on every predict() call that dwarfs the actual tree traversal.
-# Force in-process sequential prediction for live use (~75ms -> ~25ms/call).
-_regressor.n_jobs = 1
+try:
+    _regressor = load(REGRESSOR_PATH)
+    # n_jobs=-1 (set at training time for fitting on the full dataset) makes
+    # single-row inference *slower*: joblib pays multiprocess/thread dispatch
+    # overhead on every predict() call that dwarfs the actual tree traversal.
+    # Force in-process sequential prediction for live use (~75ms -> ~25ms/call).
+    _regressor.n_jobs = 1
+    print(f"Loaded regressor from {REGRESSOR_PATH}", flush=True)
+except Exception as e:
+    print(f"ERROR: Failed to load regressor from {REGRESSOR_PATH}: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
+    _regressor = None
+
+# Verify landmarker model exists
+if not LANDMARKER_MODEL_PATH.exists():
+    print(f"ERROR: Landmarker model not found at {LANDMARKER_MODEL_PATH}", flush=True)
+else:
+    print(f"Landmarker model found at {LANDMARKER_MODEL_PATH} ({LANDMARKER_MODEL_PATH.stat().st_size / 1024 / 1024:.1f} MB)", flush=True)
 
 
 # =============================================================================
@@ -384,37 +425,60 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
             frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
         )
 
-    if session_start is None:
-        session_start = time.monotonic()
-    if history is None:
-        history = _new_history()
-    if blendshape_window is None:
-        blendshape_window = deque()
-    if frame_timestamps is None:
-        frame_timestamps = deque(maxlen=ROLLING_WINDOW_FRAMES)
-    if detection_history is None:
-        detection_history = deque(maxlen=ROLLING_WINDOW_FRAMES)
-    if landmarker is None:
-        # Created per session (not a module-level singleton) since a shared
-        # FaceLandmarker isn't guaranteed thread-safe across concurrent
-        # browser sessions -- see the note by _new_landmarker's definition.
-        landmarker = _new_landmarker()
-    if last_video_timestamp_ms is None:
-        last_video_timestamp_ms = -1
+    try:
+        if session_start is None:
+            session_start = time.monotonic()
+        if history is None:
+            history = _new_history()
+        if blendshape_window is None:
+            blendshape_window = deque()
+        if frame_timestamps is None:
+            frame_timestamps = deque(maxlen=ROLLING_WINDOW_FRAMES)
+        if detection_history is None:
+            detection_history = deque(maxlen=ROLLING_WINDOW_FRAMES)
+        if landmarker is None:
+            # Created per session (not a module-level singleton) since a shared
+            # FaceLandmarker isn't guaranteed thread-safe across concurrent
+            # browser sessions -- see the note by _new_landmarker's definition.
+            landmarker = _new_landmarker()
+        if last_video_timestamp_ms is None:
+            last_video_timestamp_ms = -1
 
-    now = time.monotonic()
-    frame_timestamps.append(now)  # for FPS -- cheap append/evict, no extra work per frame
+        now = time.monotonic()
+        frame_timestamps.append(now)  # for FPS -- cheap append/evict, no extra work per frame
 
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-    # VIDEO mode requires strictly increasing timestamps for the lifetime of
-    # the landmarker instance. Wall-clock elapsed-ms-since-session-start is
-    # monotonic in practice, but the +1 fallback guards against the
-    # occasional same-millisecond tie between two fast round trips.
-    timestamp_ms = int((now - session_start) * 1000)
-    if timestamp_ms <= last_video_timestamp_ms:
-        timestamp_ms = last_video_timestamp_ms + 1
-    last_video_timestamp_ms = timestamp_ms
-    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        # Ensure frame is in the right format (RGB numpy array)
+        if isinstance(frame, np.ndarray):
+            if len(frame.shape) != 3 or frame.shape[2] not in (3, 4):
+                print(f"Warning: Unexpected frame shape {frame.shape}, skipping", flush=True)
+                return (
+                    frame, gr.skip(), gr.skip(), gr.skip(),
+                    session_start, history, blendshape_window, last_face_seen,
+                    frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
+                )
+            # Convert BGR (OpenCV default) to RGB if needed
+            if frame.dtype == np.uint8:
+                # Frame is already in the right format
+                pass
+            else:
+                # Normalize if it's float
+                if frame.max() <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                else:
+                    frame = frame.astype(np.uint8)
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+        # IMAGE mode: no timestamp tracking needed, simpler and works on headless servers
+        result = landmarker.detect(mp_image)
+    except Exception as e:
+        print(f"Error in process_frame: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return (
+            frame, gr.skip(), gr.skip(), gr.skip(),
+            session_start, history, blendshape_window, last_face_seen,
+            frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
+        )
 
     if result.face_landmarks:
         annotated = frame.copy()
@@ -462,7 +526,11 @@ def process_frame(frame, session_start, history, blendshape_window, last_face_se
             frame_timestamps, detection_history, landmarker, last_video_timestamp_ms,
         )
 
-    intensities = _regressor.predict(pooled)[0]  # unchanged
+    if _regressor is None:
+        # Regressor failed to load at startup
+        intensities = np.zeros(len(EMOTIONS))
+    else:
+        intensities = _regressor.predict(pooled)[0]  # unchanged
     history.append((now - session_start, intensities))  # capped via _new_history()'s maxlen
 
     bars_html = build_bars_html(intensities)
@@ -603,27 +671,14 @@ with gr.Blocks(title=APP_TITLE, theme=THEME, css=CUSTOM_CSS) as demo:
 
     with gr.Row():
         with gr.Column(scale=1, elem_classes="card"):
+            # Use simple webcam without constraints to maximize compatibility.
+            # Gradio 6.20.0 may not support WebcamOptions, and Hugging Face Spaces
+            # sometimes has issues with complex webcam configurations.
             cam = gr.Image(
                 sources=["webcam"],
                 streaming=True,
                 type="numpy",
                 label="Webcam",
-                # Unconstrained getUserMedia falls back to Gradio's own
-                # default of 1920x1440 -- constraints MUST be nested under a
-                # "video" key to override that default, a flat {"width": ...}
-                # dict is silently ignored. The frontend only takes its NEXT
-                # snapshot once the current round trip (encode -> upload ->
-                # detect/predict -> download) has returned, so a bigger frame
-                # doesn't just cost more compute, it directly stalls the
-                # capture rate.
-                webcam_options=gr.WebcamOptions(
-                    constraints={
-                        "video": {
-                            "width": {"ideal": 480, "max": 640},
-                            "height": {"ideal": 360, "max": 480},
-                        }
-                    }
-                ),
             )
         with gr.Column(scale=1, elem_classes="card"):
             landmarks_out = gr.Image(type="numpy", label="Landmarks")

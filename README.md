@@ -1,3 +1,16 @@
+---
+title: Live Emotion Intensity Demo
+emoji: 🎭
+colorFrom: indigo
+colorTo: gray
+sdk: gradio
+sdk_version: 6.20.0
+python_version: "3.12"
+app_file: src/ui/app.py
+pinned: false
+short_description: Webcam emotion-intensity tracking (AI4ALL Team 14a)
+---
+
 # Team 14a AI4ALL Project
 
 ## Members

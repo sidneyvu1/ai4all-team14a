@@ -1,0 +1,4 @@
+libgl1
+libglib2.0-0
+libgles2-mesa
+libglu1-mesa
